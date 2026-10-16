@@ -15,7 +15,7 @@ use obscura_dom::{DomTree, NodeData, NodeId};
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
 use obscura_net::{
-    CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response,
+    WsIn, WsOut, CallbackRegistry, CookieJar, ObscuraHttpClient, RequestInfo, ResourceType, Response,
     SameSiteContext, same_site,
 };
 #[cfg(feature = "render")]
@@ -756,6 +756,145 @@ fn op_fetch_cancel_handle(state: &mut OpState) -> u32 {
 
 // Private signal state survives realm crossings without public prototype
 // forgeries or a native Global handle that would keep dead signals alive.
+
+// ── WebSocket (real, via the stealth client) ────────────────────────────────
+// The JS WebSocket used to be a stub that reported "open" and dropped everything.
+// With the stealth transport the upgrade now goes through wreq (same TLS/HTTP
+// fingerprint + cookie jar as fetch), a pump task shuttles frames over channels,
+// and JS pulls events with op_ws_next.
+
+struct WsConn {
+    out: tokio::sync::mpsc::UnboundedSender<WsOut>,
+    inb: Rc<Mutex<tokio::sync::mpsc::UnboundedReceiver<WsIn>>>,
+}
+
+#[derive(Default)]
+struct WsTable {
+    next: u32,
+    conns: HashMap<u32, WsConn>,
+}
+
+#[op2]
+#[string]
+async fn op_ws_open(
+    state: Rc<RefCell<OpState>>,
+    #[string] url: String,
+    #[string] protocols_json: String,
+    #[string] origin: String,
+) -> Result<String, deno_error::JsErrorBox> {
+    #[cfg(not(feature = "stealth"))]
+    {
+        let _ = (&state, &url, &protocols_json, &origin);
+        return Err(deno_error::JsErrorBox::generic(
+            "WebSocket needs a stealth build and --stealth",
+        ));
+    }
+    #[cfg(feature = "stealth")]
+    {
+        let (stealth, allow_private_network) = {
+            let sb = state.borrow();
+            let gs = sb.borrow::<SharedState>().clone();
+            let gs = gs.borrow();
+            let allow = gs.http_client.as_ref().is_some_and(|c| c.allow_private_network);
+            (gs.stealth_client.clone(), allow)
+        };
+        let stealth = stealth.ok_or_else(|| {
+            deno_error::JsErrorBox::generic("WebSocket needs --stealth (no stealth client)")
+        })?;
+        let parsed = url::Url::parse(&url)
+            .map_err(|e| deno_error::JsErrorBox::generic(format!("bad ws url: {e}")))?;
+        // Same SSRF / private-network gate as scripted fetch, checked on the http(s)
+        // equivalent of the ws(s) URL.
+        let mut gate_url = parsed.clone();
+        let gate_scheme = match parsed.scheme() {
+            "ws" => "http",
+            "wss" => "https",
+            other => {
+                return Err(deno_error::JsErrorBox::generic(format!(
+                    "Forbidden URL scheme '{other}' - only ws and wss are allowed"
+                )))
+            }
+        };
+        let _ = gate_url.set_scheme(gate_scheme);
+        validate_fetch_url(&gate_url, allow_private_network)
+            .map_err(|reason| deno_error::JsErrorBox::generic(reason))?;
+        let protocols: Vec<String> = serde_json::from_str(&protocols_json).unwrap_or_default();
+        let ctx = match url::Url::parse(&origin) {
+            Ok(src) if same_site(&src, &parsed) => SameSiteContext::SameSite,
+            _ => SameSiteContext::CrossSite,
+        };
+        let (out_tx, in_rx, proto) = stealth
+            .connect_websocket(&parsed, &origin, &protocols, Some(ctx))
+            .await
+            .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+        let mut sb = state.borrow_mut();
+        if sb.try_borrow::<WsTable>().is_none() {
+            sb.put(WsTable::default());
+        }
+        let table = sb.borrow_mut::<WsTable>();
+        table.next += 1;
+        let rid = table.next;
+        table.conns.insert(rid, WsConn { out: out_tx, inb: Rc::new(Mutex::new(in_rx)) });
+        Ok(serde_json::json!({ "rid": rid, "protocol": proto }).to_string())
+    }
+}
+
+#[op2]
+#[string]
+async fn op_ws_next(
+    state: Rc<RefCell<OpState>>,
+    rid: u32,
+) -> Result<String, deno_error::JsErrorBox> {
+    let inb = {
+        let sb = state.borrow();
+        sb.try_borrow::<WsTable>()
+            .and_then(|t| t.conns.get(&rid))
+            .map(|c| c.inb.clone())
+    };
+    let Some(inb) = inb else {
+        return Ok(serde_json::json!({"t": "close", "code": 1006, "reason": ""}).to_string());
+    };
+    let ev = inb.lock().await.recv().await;
+    Ok(match ev {
+        Some(WsIn::Text(t)) => serde_json::json!({"t": "text", "data": t}),
+        Some(WsIn::Binary(b)) => serde_json::json!({"t": "bin", "data": BASE64.encode(b)}),
+        Some(WsIn::Close(c, r)) => serde_json::json!({"t": "close", "code": c, "reason": r}),
+        Some(WsIn::Error(e)) => serde_json::json!({"t": "error", "data": e}),
+        None => serde_json::json!({"t": "close", "code": 1006, "reason": ""}),
+    }
+    .to_string())
+}
+
+#[op2(fast)]
+fn op_ws_send(state: &mut OpState, rid: u32, #[string] kind: String, #[string] data: String) -> bool {
+    let Some(conn) = state.try_borrow::<WsTable>().and_then(|t| t.conns.get(&rid)) else {
+        return false;
+    };
+    let msg = if kind == "bin" {
+        match BASE64.decode(data.as_bytes()) {
+            Ok(b) => WsOut::Binary(b),
+            Err(_) => return false,
+        }
+    } else {
+        WsOut::Text(data)
+    };
+    conn.out.send(msg).is_ok()
+}
+
+#[op2(fast)]
+fn op_ws_close(state: &mut OpState, rid: u32, code: u32, #[string] reason: String) {
+    if let Some(conn) = state.try_borrow::<WsTable>().and_then(|t| t.conns.get(&rid)) {
+        let _ = conn.out.send(WsOut::Close(code as u16, reason));
+    }
+}
+
+#[op2(fast)]
+fn op_ws_release(state: &mut OpState, rid: u32) {
+    if let Some(t) = state.try_borrow_mut::<WsTable>() {
+        t.conns.remove(&rid);
+    }
+}
+
 #[op2]
 fn op_abort_signal_state<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
@@ -6877,6 +7016,11 @@ pub fn build_extension() -> Extension {
         op_report_browser_exception(),
         op_fetch_url(),
         op_fetch_cancel_handle(),
+        op_ws_open(),
+        op_ws_next(),
+        op_ws_send(),
+        op_ws_close(),
+        op_ws_release(),
         op_abort_signal_state(),
         op_fetch_body(),
         op_get_cookies(),

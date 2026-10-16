@@ -80,6 +80,19 @@ fn tracker_blocking_enabled(value: Option<&str>) -> bool {
     )
 }
 
+/// An error with its `source()` chain flattened ("outer: inner: root cause").
+#[cfg(feature = "stealth")]
+fn error_chain(e: &(dyn Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        src = s.source();
+    }
+    out
+}
+
 #[cfg(feature = "stealth")]
 fn is_tracker_blocked(url: &Url, block_trackers: bool) -> bool {
     block_trackers && url.host_str().is_some_and(crate::blocklist::is_blocked)
@@ -588,6 +601,80 @@ impl StealthHttpClient {
         })
     }
 
+    /// Open a WebSocket through the stealth client so the upgrade carries the same
+    /// TLS/HTTP fingerprint, cookies and client hints as scripted fetch (servers may
+    /// bind session cookies to the fingerprint). Returns the socket and the chosen subprotocol.
+    pub async fn connect_websocket(
+        &self,
+        url: &Url,
+        origin: &str,
+        protocols: &[String],
+        cookie_context: Option<SameSiteContext>,
+    ) -> Result<(tokio::sync::mpsc::UnboundedSender<crate::WsOut>, tokio::sync::mpsc::UnboundedReceiver<crate::WsIn>, String), ObscuraNetError> {
+        // Cookies are matched against the http(s) equivalent of ws(s): the jar only
+        // treats https as secure, so a wss URL would never send Secure cookies
+        // (e.g. clearance cookies) and the server could refuse the upgrade.
+        let mut ws_cookie_names = String::new();
+        let mut cookie_url = url.clone();
+        let _ = cookie_url.set_scheme(if url.scheme() == "wss" { "https" } else if url.scheme() == "ws" { "http" } else { url.scheme() });
+        let mut req = self
+            .client
+            .websocket(url.as_str())
+            .default_headers(false)
+            .header("user-agent", STEALTH_USER_AGENT);
+        if !protocols.is_empty() {
+            req = req.protocols(protocols.to_vec());
+        }
+        if let Some(context) = cookie_context {
+            let cookie_header = self.cookie_jar.get_cookie_header_in_context(&cookie_url, context);
+            if !cookie_header.is_empty() {
+                req = req.header("cookie", cookie_header.as_str());
+            }
+            ws_cookie_names = cookie_header.split(';').map(|c| c.trim().split('=').next().unwrap_or("").to_string()).collect::<Vec<_>>().join(",");
+        }
+        for (k, v) in self.extra_headers.read().await.iter() {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        if !origin.is_empty() {
+            req = req.header("origin", origin);
+        }
+        let resp = req.send().await.map_err(|e| {
+            ObscuraNetError::Network(format!("{}: {}", url, error_chain(&e)))
+        })?;
+        for val in resp.headers().get_all("set-cookie") {
+            if let Ok(s) = val.to_str() {
+                self.cookie_jar.set_cookie(s, &cookie_url);
+            }
+        }
+        if resp.status().as_u16() != 101 {
+            let status = resp.status().as_u16();
+            let hdrs: Vec<String> = resp
+                .headers()
+                .iter()
+                .filter(|(k, _)| {
+                    !matches!(k.as_str(), "set-cookie" | "date" | "connection" | "content-length")
+                })
+                .map(|(k, v)| format!("{}={}", k, v.to_str().unwrap_or("?")))
+                .collect();
+            return Err(ObscuraNetError::Network(format!(
+                "{}: websocket upgrade refused: status {} cookies=[{}] [{}]",
+                url, status, ws_cookie_names, hdrs.join(" ")
+            )));
+        }
+        let ws = resp.into_websocket().await.map_err(|e| {
+            ObscuraNetError::Network(format!("{}: websocket upgrade: {}", url, error_chain(&e)))
+        })?;
+        let proto = ws
+            .protocol()
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(ws_pump(ws, out_rx, in_tx));
+        Ok((out_tx, in_rx, proto))
+    }
+
     pub async fn set_extra_headers(&self, headers: HashMap<String, String>) {
         *self.extra_headers.write().await = headers;
     }
@@ -925,5 +1012,60 @@ mod tests {
             .await
             .expect("loopback hostname must be reachable with the opt-in");
         assert_eq!(resp.status, 200);
+    }
+}
+
+/// Shuttle frames between a wreq WebSocket and a pair of channels until either side closes.
+#[cfg(feature = "stealth")]
+async fn ws_pump(
+    mut ws: wreq::ws::WebSocket,
+    mut out_rx: tokio::sync::mpsc::UnboundedReceiver<crate::WsOut>,
+    in_tx: tokio::sync::mpsc::UnboundedSender<crate::WsIn>,
+) {
+    use crate::{WsIn, WsOut};
+    use wreq::ws::message::Message;
+    loop {
+        tokio::select! {
+            m = ws.recv() => match m {
+                Some(Ok(Message::Text(t))) => { let _ = in_tx.send(WsIn::Text(t.as_str().to_string())); }
+                Some(Ok(Message::Binary(b))) => { let _ = in_tx.send(WsIn::Binary(b.to_vec())); }
+                Some(Ok(Message::Close(f))) => {
+                    let (c, r) = f
+                        .map(|f| (u16::from(f.code), f.reason.as_str().to_string()))
+                        .unwrap_or((1005, String::new()));
+                    let _ = in_tx.send(WsIn::Close(c, r));
+                    break;
+                }
+                Some(Ok(_)) => {} // ping/pong are answered by the library
+                Some(Err(e)) => {
+                    let _ = in_tx.send(WsIn::Error(e.to_string()));
+                    let _ = in_tx.send(WsIn::Close(1006, String::new()));
+                    break;
+                }
+                None => { let _ = in_tx.send(WsIn::Close(1006, String::new())); break; }
+            },
+            o = out_rx.recv() => match o {
+                Some(WsOut::Text(t)) => {
+                    if let Err(e) = ws.send(Message::text(t)).await {
+                        let _ = in_tx.send(WsIn::Error(e.to_string()));
+                        let _ = in_tx.send(WsIn::Close(1006, String::new()));
+                        break;
+                    }
+                }
+                Some(WsOut::Binary(b)) => {
+                    if let Err(e) = ws.send(Message::binary(b)).await {
+                        let _ = in_tx.send(WsIn::Error(e.to_string()));
+                        let _ = in_tx.send(WsIn::Close(1006, String::new()));
+                        break;
+                    }
+                }
+                Some(WsOut::Close(c, r)) => {
+                    let _ = ws.close(c, r).await;
+                    let _ = in_tx.send(WsIn::Close(c, String::new()));
+                    break;
+                }
+                None => break,
+            },
+        }
     }
 }

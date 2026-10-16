@@ -16367,8 +16367,24 @@ if (typeof EventSource === 'undefined') {
 }
 
 if (typeof WebSocket === 'undefined') {
+  // Real WebSocket: the upgrade, frames and close go through the Rust side
+  // (op_ws_*), which uses the stealth client when --stealth is on. Without it
+  // op_ws_open rejects and the socket fails like an unreachable host.
+  const _wsBytesToB64 = (u8) => {
+    let bin = '';
+    for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+    return btoa(bin);
+  };
+  const _wsB64ToBytes = (b64) => {
+    const bin = atob(b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return u8;
+  };
   globalThis.WebSocket = class WebSocket {
     constructor(url, protocols) {
+      // URL parsing strips leading/trailing C0/space; some apps build URLs with a leading space and rely on it.
+      if (typeof url === 'string') url = url.replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, '');
       // Validate URL scheme per spec — Chrome throws SyntaxError for non-ws/wss URLs
       if (typeof url !== 'string' || !/^wss?:\/\//i.test(url)) {
         throw new DOMException(
@@ -16381,25 +16397,77 @@ if (typeof WebSocket === 'undefined') {
       this.bufferedAmount = 0;
       this.binaryType = 'blob';
       this.extensions = '';
-      this.protocol = Array.isArray(protocols) ? (protocols[0] || '') : (protocols || '');
+      this.protocol = '';
       this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
+      this._rid = 0;
+      this._closeReq = null;
       _makeListenerBox(this);
-      Promise.resolve().then(() => {
-        if (this.readyState !== 0) return;
+      const protos = Array.isArray(protocols) ? protocols : (protocols ? [String(protocols)] : []);
+      const origin = (globalThis.location && globalThis.location.origin) || '';
+      __obscuraCore.ops.op_ws_open(url, JSON.stringify(protos), origin).then((res) => {
+        const info = JSON.parse(res);
+        this._rid = info.rid;
+        this.protocol = info.protocol || '';
+        if (this.readyState !== 0) {   // close() was called while connecting
+          __obscuraCore.ops.op_ws_close(this._rid, 1000, '');
+          this._pump();
+          return;
+        }
         this.readyState = 1; // OPEN
-        const ev = new Event('open');
-        if (typeof this.onopen === 'function') { try { this.onopen(ev); } catch (e) {} }
-        try { this.dispatchEvent(ev); } catch (e) {}
+        this._emit('open', new Event('open'));
+        this._pump();
+      }, (err) => {
+        try { console.log('[obscura-ws] open failed ' + url + ': ' + (err && err.message || err)); } catch (e) {}
+        this.readyState = 3;
+        this._emit('error', new Event('error'));
+        this._emitClose(1006, '', false);
       });
     }
-    send(data) { /* drop; no real socket */ }
+    _emit(type, ev) {
+      const h = this['on' + type];
+      if (typeof h === 'function') { try { h.call(this, ev); } catch (e) {} }
+      try { this.dispatchEvent(ev); } catch (e) {}
+    }
+    _emitClose(code, reason, clean) {
+      const ev = new Event('close');
+      ev.code = code; ev.reason = reason || ''; ev.wasClean = !!clean;
+      this._emit('close', ev);
+    }
+    async _pump() {
+      const ops = __obscuraCore.ops;
+      for (;;) {
+        let m;
+        try { m = JSON.parse(await ops.op_ws_next(this._rid)); } catch (e) { m = { t: 'close', code: 1006, reason: '' }; }
+        if (m.t === 'text') {
+          this._emit('message', new MessageEvent('message', { data: m.data, origin: this.url }));
+        } else if (m.t === 'bin') {
+          const u8 = _wsB64ToBytes(m.data);
+          const data = this.binaryType === 'arraybuffer' ? u8.buffer : new Blob([u8]);
+          this._emit('message', new MessageEvent('message', { data, origin: this.url }));
+        } else if (m.t === 'error') {
+          this._emit('error', new Event('error'));
+        } else {
+          const wasOpen = this.readyState !== 3;
+          this.readyState = 3;
+          ops.op_ws_release(this._rid);
+          if (wasOpen) this._emitClose(m.code, m.reason, m.code !== 1006);
+          return;
+        }
+      }
+    }
+    send(data) {
+      if (this.readyState === 0) throw new DOMException("Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.", 'InvalidStateError');
+      if (this.readyState !== 1) return;
+      const ops = __obscuraCore.ops;
+      if (typeof data === 'string') ops.op_ws_send(this._rid, 'text', data);
+      else if (data instanceof ArrayBuffer) ops.op_ws_send(this._rid, 'bin', _wsBytesToB64(new Uint8Array(data)));
+      else if (ArrayBuffer.isView(data)) ops.op_ws_send(this._rid, 'bin', _wsBytesToB64(new Uint8Array(data.buffer, data.byteOffset, data.byteLength)));
+      else ops.op_ws_send(this._rid, 'text', String(data));
+    }
     close(code, reason) {
       if (this.readyState >= 2) return;
-      this.readyState = 3; // CLOSED
-      const ev = new Event('close');
-      ev.code = code || 1000; ev.reason = reason || ''; ev.wasClean = true;
-      if (typeof this.onclose === 'function') { try { this.onclose(ev); } catch (e) {} }
-      try { this.dispatchEvent(ev); } catch (e) {}
+      this.readyState = 2; // CLOSING
+      if (this._rid) __obscuraCore.ops.op_ws_close(this._rid, code || 1000, reason || '');
     }
     static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
   };

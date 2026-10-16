@@ -1,4 +1,6 @@
 pub mod client;
+pub mod ws;
+pub use ws::{WsIn, WsOut};
 pub mod cookies;
 pub mod encoding;
 pub mod interceptor;
