@@ -94,6 +94,14 @@ fn error_chain(e: &(dyn Error + 'static)) -> String {
 }
 
 #[cfg(feature = "stealth")]
+fn ws_advertises_deflate(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+#[cfg(feature = "stealth")]
 fn is_tracker_blocked(url: &Url, block_trackers: bool) -> bool {
     block_trackers && url.host_str().is_some_and(crate::blocklist::is_blocked)
 }
@@ -601,6 +609,34 @@ impl StealthHttpClient {
         })
     }
 
+    /// Header order and casing of a Chrome WebSocket handshake (HTTP/1.1 sends them
+    /// verbatim, and bot detection compares them). Names absent from a request are skipped.
+    fn websocket_header_order() -> wreq::header::OrigHeaderMap {
+        let mut m = wreq::header::OrigHeaderMap::new();
+        for n in ["Host", "Connection", "Pragma", "Cache-Control", "User-Agent", "Upgrade", "Origin",
+                  "Sec-WebSocket-Version", "Accept-Encoding", "Accept-Language", "Cookie",
+                  "Sec-WebSocket-Key", "Sec-WebSocket-Extensions"] {
+            m.insert(n);
+        }
+        m
+    }
+
+    /// Chrome's TLS profile as seen on a WebSocket connection: ALPN offers http/1.1 only,
+    /// and with no h2 on offer BoringSSL omits the ALPS extension (17613). The shared
+    /// client's profile is the *page* one (h2 + ALPS), whose ClientHello differs.
+    fn websocket_emulation() -> wreq::Emulation {
+        let mut emu = wreq::IntoEmulation::into_emulation(wreq_util::Emulation::builder()
+            .profile(wreq_util::Profile::Chrome145)
+            .platform(wreq_util::Platform::Windows)
+            .build());
+        if let Some(tls) = emu.tls_options.as_mut() {
+            tls.alpn_protocols = Some(std::borrow::Cow::Owned(vec![wreq::tls::AlpnProtocol::HTTP1]));
+            tls.alps_protocols = None;
+        }
+        emu.headers.clear();
+        emu
+    }
+
     /// Open a WebSocket through the stealth client so the upgrade carries the same
     /// TLS/HTTP fingerprint, cookies and client hints as scripted fetch (servers may
     /// bind session cookies to the fingerprint). Returns the socket and the chosen subprotocol.
@@ -617,11 +653,26 @@ impl StealthHttpClient {
         let mut ws_cookie_names = String::new();
         let mut cookie_url = url.clone();
         let _ = cookie_url.set_scheme(if url.scheme() == "wss" { "https" } else if url.scheme() == "ws" { "http" } else { url.scheme() });
+        // The emulation's default headers describe a top-level *navigation*
+        // (sec-fetch-dest: document, accept: text/html, priority, sec-ch-ua). A real
+        // Chrome WebSocket handshake sends none of those, and some servers refuse
+        // the upgrade when they see them. Send a Chrome-shaped handshake instead.
         let mut req = self
             .client
             .websocket(url.as_str())
+            .emulation(Self::websocket_emulation())
+            .orig_headers(Self::websocket_header_order())
             .default_headers(false)
-            .header("user-agent", STEALTH_USER_AGENT);
+            .header("user-agent", STEALTH_USER_AGENT)
+            .header("accept-encoding", "gzip, deflate, br, zstd")
+            .header("accept-language", "en-US,en;q=0.9")
+            .header("cache-control", "no-cache")
+            .header("pragma", "no-cache");
+        // Chrome offers permessage-deflate. We cannot compress or decompress frames, so a
+        // server that accepts the offer breaks the connection: opt-in only.
+        if ws_advertises_deflate(std::env::var("OBSCURA_WS_ADVERTISE_DEFLATE").ok().as_deref()) {
+            req = req.header("sec-websocket-extensions", "permessage-deflate; client_max_window_bits");
+        }
         if !protocols.is_empty() {
             req = req.protocols(protocols.to_vec());
         }

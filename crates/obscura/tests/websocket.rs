@@ -104,3 +104,58 @@ async fn page_websocket_respects_private_network_gate() {
     assert_eq!(r, serde_json::json!(["error"]));
     assert_eq!(accepted.load(Ordering::SeqCst), 0);
 }
+
+/// Accepts one upgrade and reports whether the client offered permessage-deflate.
+fn spawn_handshake_probe() -> (String, std::sync::mpsc::Receiver<bool>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = tungstenite::accept_hdr(stream, |req: &tungstenite::handshake::server::Request, resp| {
+                    let offered = req
+                        .headers()
+                        .get("sec-websocket-extensions")
+                        .is_some_and(|v| v.to_str().is_ok_and(|v| v.contains("permessage-deflate")));
+                    let _ = tx.send(offered);
+                    Ok(resp)
+                });
+            });
+        }
+    });
+    (addr.to_string(), rx)
+}
+
+async fn deflate_offered(switch: Option<&str>) -> bool {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    match switch {
+        Some(v) => std::env::set_var("OBSCURA_WS_ADVERTISE_DEFLATE", v),
+        None => std::env::remove_var("OBSCURA_WS_ADVERTISE_DEFLATE"),
+    }
+    let (ws_addr, rx) = spawn_handshake_probe();
+    let base = spawn_http();
+
+    let browser = Browser::builder().stealth(true).build().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+    page.evaluate(&format!("(() => {{ new WebSocket('ws://{ws_addr}'); return true; }})()"));
+    for _ in 0..20 {
+        page.settle(250).await;
+        if let Ok(offered) = rx.try_recv() {
+            return offered;
+        }
+    }
+    panic!("server never saw the upgrade");
+}
+
+#[tokio::test]
+async fn websocket_handshake_omits_deflate_by_default() {
+    assert!(!deflate_offered(None).await);
+}
+
+#[tokio::test]
+async fn websocket_handshake_offers_deflate_when_enabled() {
+    assert!(deflate_offered(Some("1")).await);
+}
