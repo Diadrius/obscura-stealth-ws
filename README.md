@@ -1,3 +1,5 @@
+> **Unofficial fork of [h4ckf0r0day/obscura](https://github.com/h4ckf0r0day/obscura).** Branch `ws-stealth` (based on `v0.2.4`) adds a working `WebSocket` and a Chrome-shaped WebSocket handshake to the stealth build, plus a Linux release workflow. See [docs/websocket-patch.md](docs/websocket-patch.md). Everything else is upstream.
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/h4ckf0r0day/obscura/main/assets/icon.png" alt="Obscura" width="80" />
 </p>
